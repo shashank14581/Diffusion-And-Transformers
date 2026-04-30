@@ -1,10 +1,17 @@
 #!pip install -q lightning
 
-import torch, lightning as L
+import re, torch, lightning as L
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset
+import numpy as np
 
+from collections import Counter
+from torch.utils.data import Dataset, DataLoader
+from sklearn.model_selection import train_test_split
+from sklearn.utils.class_weight import compute_class_weight
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+
+# ---------------- DATA ----------------
 texts = [
     "apple banana smoothie with honey",
     "mango orange fruit salad",
@@ -18,26 +25,73 @@ texts = [
     "potato cauliflower vegetable roast",
 ]
 
-labels = [0,0,0,0,0, 1,1,1,1,1]   # 0 = fruit recipe, 1 = vegetable recipe
+labels = [0,0,0,0,0, 1,1,1,1,1]   # 0 = fruit, 1 = vegetable
 
+train_texts, val_texts, train_labels, val_labels = train_test_split(
+    texts, labels, test_size=0.2, stratify=labels, random_state=42
+)
+
+# ---------------- PREPROCESS ----------------
+def preprocess(text):
+    text = text.lower()
+    text = re.sub(r"[^a-zA-Z\s]", "", text)
+    return text.split()
+
+train_tokens = [preprocess(t) for t in train_texts]
+val_tokens = [preprocess(t) for t in val_texts]
+
+# ---------------- VOCAB ----------------
+word_counts = Counter(w for sent in train_tokens for w in sent)
 vocab = {"<pad>": 0, "<unk>": 1}
-for text in texts:
-    for word in text.split():
-        if word not in vocab:
-            vocab[word] = len(vocab)
 
+for word, count in word_counts.items():
+    if count >= 1:
+        vocab[word] = len(vocab)
+
+def encode(tokens):
+    return [vocab.get(w, vocab["<unk>"]) for w in tokens]
+
+train_encoded = [encode(t) for t in train_tokens]
+val_encoded = [encode(t) for t in val_tokens]
+
+# ---------------- DATASET ----------------
 class RecipeDataset(Dataset):
-    def __init__(self, texts, labels, max_len=8):
-        self.texts, self.labels, self.max_len = texts, labels, max_len
+    def __init__(self, texts, labels):
+        self.texts = texts
+        self.labels = labels
 
     def __len__(self):
         return len(self.texts)
 
     def __getitem__(self, idx):
-        ids = [vocab.get(w, 1) for w in self.texts[idx].split()]
-        ids = ids[:self.max_len] + [0] * (self.max_len - len(ids))
-        return torch.tensor(ids), torch.tensor(self.labels[idx])
+        return torch.tensor(self.texts[idx]), torch.tensor(self.labels[idx])
 
+def collate_fn(batch):
+    texts, labels = zip(*batch)
+
+    max_len = max(len(x) for x in texts)
+    padded = torch.zeros(len(texts), max_len, dtype=torch.long)
+
+    for i, x in enumerate(texts):
+        padded[i, :len(x)] = x
+
+    return padded, torch.tensor(labels)
+
+train_loader = DataLoader(
+    RecipeDataset(train_encoded, train_labels),
+    batch_size=4,
+    shuffle=True,
+    collate_fn=collate_fn
+)
+
+val_loader = DataLoader(
+    RecipeDataset(val_encoded, val_labels),
+    batch_size=4,
+    shuffle=False,
+    collate_fn=collate_fn
+)
+
+# ---------------- SELF ATTENTION ----------------
 class SelfAttention(nn.Module):
     def __init__(self, d_model):
         super().__init__()
@@ -45,46 +99,114 @@ class SelfAttention(nn.Module):
         self.k = nn.Linear(d_model, d_model)
         self.v = nn.Linear(d_model, d_model)
 
-    def forward(self, x):
-        Q, K, V = self.q(x), self.k(x), self.v(x)
+    def forward(self, x, mask=None):
+        Q = self.q(x)
+        K = self.k(x)
+        V = self.v(x)
+
         scores = Q @ K.transpose(-2, -1) / (x.size(-1) ** 0.5)
+
+        if mask is not None:
+            scores = scores.masked_fill(mask == 0, -1e9)
+
         weights = F.softmax(scores, dim=-1)
+
         return weights @ V
 
+# ---------------- LIGHTNING MODEL ----------------
 class LitRecipeClassifier(L.LightningModule):
-    def __init__(self, vocab_size, d_model=32):
+    def __init__(self, vocab_size, class_weights, d_model=64, num_classes=2):
         super().__init__()
-        self.emb = nn.Embedding(vocab_size, d_model)
+
+        self.emb = nn.Embedding(vocab_size, d_model, padding_idx=0)
         self.attn = SelfAttention(d_model)
-        self.fc = nn.Linear(d_model, 2)
+        self.fc = nn.Linear(d_model, num_classes)
+
+        self.register_buffer("class_weights", class_weights)
 
     def forward(self, x):
+        mask = (x != 0).unsqueeze(1)
+
         x = self.emb(x)
-        x = self.attn(x)
-        x = x.mean(dim=1)
-        return self.fc(x)
+        x = self.attn(x, mask)
+
+        token_mask = mask.transpose(1, 2)
+        x = x * token_mask
+
+        pooled = x.sum(dim=1) / token_mask.sum(dim=1).clamp(min=1)
+
+        return self.fc(pooled)
 
     def training_step(self, batch, batch_idx):
         x, y = batch
-        loss = F.cross_entropy(self(x), y)
-        self.log("loss", loss)
+        loss = F.cross_entropy(self(x), y, weight=self.class_weights)
+        self.log("train_loss", loss, prog_bar=True)
         return loss
+
+    def validation_step(self, batch, batch_idx):
+        x, y = batch
+        loss = F.cross_entropy(self(x), y, weight=self.class_weights)
+        self.log("val_loss", loss, prog_bar=True)
 
     def configure_optimizers(self):
         return torch.optim.AdamW(self.parameters(), lr=1e-3)
 
-loader = DataLoader(RecipeDataset(texts, labels), batch_size=4, shuffle=True)
+# ---------------- CLASS WEIGHTS ----------------
+weights = compute_class_weight(
+    class_weight="balanced",
+    classes=np.unique(train_labels),
+    y=train_labels
+)
 
-model = LitRecipeClassifier(len(vocab))
-trainer = L.Trainer(max_epochs=30, accelerator="auto", logger=False)
-trainer.fit(model, loader)
+weights = torch.tensor(weights, dtype=torch.float)
 
+# ---------------- TRAIN ----------------
+model = LitRecipeClassifier(len(vocab), weights)
+
+trainer = L.Trainer(
+    max_epochs=30,
+    accelerator="auto",
+    logger=False,
+    enable_checkpointing=False
+)
+
+trainer.fit(model, train_loader, val_loader)
+
+# ---------------- EVAL ----------------
+device = model.device
+model.eval()
+
+preds, actuals = [], []
+
+with torch.no_grad():
+    for x, y in val_loader:
+        x = x.to(device)
+        output = model(x)
+        pred = output.argmax(dim=1).cpu().numpy()
+
+        preds.extend(pred)
+        actuals.extend(y.numpy())
+
+print("Accuracy:", accuracy_score(actuals, preds))
+print("Precision:", precision_score(actuals, preds, zero_division=0))
+print("Recall:", recall_score(actuals, preds, zero_division=0))
+print("F1:", f1_score(actuals, preds, zero_division=0))
+
+# ---------------- PREDICT ----------------
 def predict(text):
-    ids = [vocab.get(w, 1) for w in text.split()]
-    ids = ids[:8] + [0] * (8 - len(ids))
-    x = torch.tensor([ids])
-    pred = model(x).argmax(1).item()
-    return "fruit recipe" if pred == 0 else "vegetable recipe"
+    tokens = preprocess(text)
+    ids = encode(tokens)
+
+    x = torch.tensor([ids], dtype=torch.long).to(model.device)
+
+    model.eval()
+    with torch.no_grad():
+        pred = model(x).argmax(dim=1).item()
+
+    return "vegetable" if pred == 1 else "fruit"
 
 print(predict("banana mango smoothie"))
 print(predict("potato carrot soup"))
+print(predict("Blueberry muffins"))
+print(predict("Spinach curry"))
+print(predict("Avocado toast"))
